@@ -6,7 +6,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios from "axios";
 
-const BASE_URL = "https://gamma-api.polymarket.com";
+const BASE_URL  = "https://gamma-api.polymarket.com";
+const CLOB_URL  = "https://clob.polymarket.com";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -22,6 +23,28 @@ interface Market {
   closed: boolean;
   slug?: string;
   conditionId?: string;
+}
+
+interface PriceHistoryPoint {
+  t: number;   // Unix timestamp (seconds)
+  p: number;   // price 0–1
+}
+
+interface PriceHistoryResponse {
+  history: PriceHistoryPoint[];
+}
+
+interface MarketScoreData {
+  market: Market;
+  yesProb: number;
+  volumeNum: number;
+  daysRemaining: number;
+  sevenDayMove: number | null;
+  liquidityScore: number;
+  timeScore: number;
+  uncertaintyScore: number;
+  momentumScore: number;
+  total: number;
 }
 
 // ── Formatting helpers ───────────────────────────────────────────────────────
@@ -95,7 +118,104 @@ async function fetchMarket(marketId: string): Promise<Market> {
   return response.data;
 }
 
-// ── Tool handlers ────────────────────────────────────────────────────────────
+async function fetchPriceHistory(conditionId: string): Promise<PriceHistoryPoint[]> {
+  const response = await axios.get<PriceHistoryResponse>(
+    `${CLOB_URL}/prices-history`,
+    {
+      params: { market: conditionId, interval: "1w", fidelity: 60 },
+      timeout: 5_000,
+    }
+  );
+  return response.data?.history ?? [];
+}
+
+// Returns the price change in percentage points over the last 7 days.
+function calcSevenDayMove(history: PriceHistoryPoint[]): number | null {
+  if (history.length < 2) return null;
+  const sorted = [...history].sort((a, b) => a.t - b.t);
+  const nowSec = Date.now() / 1000;
+  const sevenDaysAgoSec = nowSec - 7 * 24 * 60 * 60;
+
+  const oldPoint = sorted.reduce((best, p) =>
+    Math.abs(p.t - sevenDaysAgoSec) < Math.abs(best.t - sevenDaysAgoSec) ? p : best
+  );
+  const currentPoint = sorted[sorted.length - 1];
+  // Return raw point difference (0-100 scale)
+  return (currentPoint.p - oldPoint.p) * 100;
+}
+
+// ── Shared scoring logic (used by score_market and generate_trade_thesis) ────
+
+async function computeScore(marketId: string): Promise<MarketScoreData> {
+  const m = await fetchMarket(marketId);
+
+  const prices    = parsePrices(m.outcomePrices);
+  const yesProb   = prices[0] ?? 0;
+  const volumeNum = parseFloat(m.volume) || 0;
+
+  const nowMs        = Date.now();
+  const endMs        = m.endDate ? new Date(m.endDate).getTime() : 0;
+  const daysRemaining = endMs > nowMs ? Math.ceil((endMs - nowMs) / (1000 * 60 * 60 * 24)) : 0;
+
+  // Liquidity score
+  let liquidityScore: number;
+  if      (volumeNum >= 1_000_000) liquidityScore = 25;
+  else if (volumeNum >= 500_000)   liquidityScore = 20;
+  else if (volumeNum >= 100_000)   liquidityScore = 15;
+  else if (volumeNum >= 10_000)    liquidityScore = 8;
+  else                              liquidityScore = 2;
+
+  // Time score
+  let timeScore: number;
+  if (!m.endDate || m.closed)      timeScore = 0;
+  else if (daysRemaining <= 30)    timeScore = 25;
+  else if (daysRemaining <= 90)    timeScore = 20;
+  else if (daysRemaining <= 180)   timeScore = 12;
+  else                              timeScore = 5;
+
+  // Uncertainty score
+  const yesPctNum = yesProb * 100;
+  let uncertaintyScore: number;
+  if      (yesPctNum >= 40 && yesPctNum <= 60) uncertaintyScore = 25;
+  else if ((yesPctNum >= 30 && yesPctNum < 40) || (yesPctNum > 60 && yesPctNum <= 70)) uncertaintyScore = 20;
+  else if ((yesPctNum >= 20 && yesPctNum < 30) || (yesPctNum > 70 && yesPctNum <= 80)) uncertaintyScore = 12;
+  else uncertaintyScore = 5;
+
+  // Momentum score (7-day price history)
+  const conditionId = m.conditionId ?? m.id;
+  let sevenDayMove: number | null = null;
+  let momentumScore = 10; // neutral when history unavailable
+
+  try {
+    const history = await fetchPriceHistory(conditionId);
+    sevenDayMove = calcSevenDayMove(history);
+    if (sevenDayMove !== null) {
+      const absMoved = Math.abs(sevenDayMove);
+      if      (absMoved > 15) momentumScore = 25;
+      else if (absMoved >= 10) momentumScore = 20;
+      else if (absMoved >= 5)  momentumScore = 12;
+      else if (absMoved >= 2)  momentumScore = 8;
+      else                      momentumScore = 3;
+    }
+  } catch {
+    // history unavailable — neutral score stays at 10
+  }
+
+  return {
+    market: m,
+    yesProb,
+    volumeNum,
+    daysRemaining,
+    sevenDayMove,
+    liquidityScore,
+    timeScore,
+    uncertaintyScore,
+    momentumScore,
+    total: liquidityScore + timeScore + uncertaintyScore + momentumScore,
+  };
+}
+
+// ── Tool handlers (original 5) ───────────────────────────────────────────────
 
 async function searchMarkets(query: string, limit = 10): Promise<string> {
   const markets = await fetchMarkets({
@@ -138,7 +258,7 @@ async function getMarket(marketId: string): Promise<string> {
   }
 
   const outcomes = parseOutcomes(m.outcomes);
-  const prices = parsePrices(m.outcomePrices);
+  const prices   = parsePrices(m.outcomePrices);
 
   const outcomeLines = outcomes
     .map((outcome, i) => {
@@ -194,7 +314,6 @@ async function compareMarkets(marketIds: string[]): Promise<string> {
   }
 
   const results = await Promise.allSettled(marketIds.map(fetchMarket));
-
   const sections: string[] = [];
 
   results.forEach((result, i) => {
@@ -210,8 +329,8 @@ async function compareMarkets(marketIds: string[]): Promise<string> {
       return;
     }
 
-    const outcomes = parseOutcomes(m.outcomes);
-    const prices = parsePrices(m.outcomePrices);
+    const outcomes   = parseOutcomes(m.outcomes);
+    const prices     = parsePrices(m.outcomePrices);
     const outcomeStr = outcomes
       .map((o, idx) => `${o}: ${prices[idx] != null ? (prices[idx] * 100).toFixed(1) + "%" : "N/A"}`)
       .join(" | ");
@@ -224,15 +343,304 @@ async function compareMarkets(marketIds: string[]): Promise<string> {
   return `Comparing ${marketIds.length} markets:\n\n${sections.join("\n\n")}`;
 }
 
+// ── Tool handlers (new analytical 4) ────────────────────────────────────────
+
+async function detectMomentum(query: string, threshold = 10): Promise<string> {
+  const markets = await fetchMarkets({ search: query, limit: 20, active: true, closed: false });
+
+  if (!markets || markets.length === 0) {
+    return `No active markets found matching "${query}".`;
+  }
+
+  interface MomentumResult {
+    market: Market;
+    currentPrice: number;
+    price7dAgo: number;
+    momentumScore: number;
+  }
+
+  const results: MomentumResult[] = [];
+  const skipped: string[] = [];
+
+  await Promise.allSettled(
+    markets.map(async (m) => {
+      const conditionId = m.conditionId ?? m.id;
+      try {
+        const history = await fetchPriceHistory(conditionId);
+        if (history.length < 2) {
+          skipped.push(m.question);
+          return;
+        }
+        const sorted        = [...history].sort((a, b) => a.t - b.t);
+        const nowSec        = Date.now() / 1000;
+        const sevenDaysAgo  = nowSec - 7 * 24 * 60 * 60;
+        const oldPoint      = sorted.reduce((best, p) =>
+          Math.abs(p.t - sevenDaysAgo) < Math.abs(best.t - sevenDaysAgo) ? p : best
+        );
+        const currentPoint  = sorted[sorted.length - 1];
+
+        // Percentage-change momentum: ((current - old) / old) * 100
+        const momentumScore = oldPoint.p !== 0
+          ? ((currentPoint.p - oldPoint.p) / oldPoint.p) * 100
+          : (currentPoint.p - oldPoint.p) * 100;
+
+        results.push({
+          market: m,
+          currentPrice: currentPoint.p,
+          price7dAgo: oldPoint.p,
+          momentumScore,
+        });
+      } catch {
+        skipped.push(m.question);
+      }
+    })
+  );
+
+  // Sort by absolute momentum descending
+  results.sort((a, b) => Math.abs(b.momentumScore) - Math.abs(a.momentumScore));
+
+  const highMomentum = results.filter(r => Math.abs(r.momentumScore) >= threshold);
+  const lines: string[] = [];
+
+  if (results.length === 0) {
+    lines.push(`No price history available for markets matching "${query}".`);
+  } else if (highMomentum.length === 0) {
+    lines.push(`No markets exceeding momentum threshold (${threshold}) found for "${query}".\n`);
+    lines.push("All analyzed markets (ranked by momentum):");
+    for (const r of results) {
+      const sign = r.momentumScore >= 0 ? "+" : "";
+      lines.push(`  • ${r.market.question.slice(0, 80)}`);
+      lines.push(`    7-Day Move: ${sign}${r.momentumScore.toFixed(1)}% | Current YES: ${(r.currentPrice * 100).toFixed(1)}%`);
+    }
+  } else {
+    lines.push(`High-momentum markets (|score| ≥ ${threshold}) for "${query}":\n`);
+    for (const r of highMomentum) {
+      const dir  = r.momentumScore > 0 ? "RISING" : "FALLING";
+      const sign = r.momentumScore > 0 ? "+" : "";
+      lines.push(r.market.question);
+      lines.push(`  Direction:             ${dir}`);
+      lines.push(`  7-Day Move:            ${sign}${r.momentumScore.toFixed(1)}%`);
+      lines.push(`  Current YES probability: ${(r.currentPrice * 100).toFixed(1)}%`);
+      lines.push(`  Volume:                ${formatVolume(r.market.volume)}`);
+      lines.push(`  Momentum Score:        ${Math.abs(r.momentumScore).toFixed(1)}`);
+      lines.push("");
+    }
+  }
+
+  if (skipped.length > 0) {
+    lines.push(`\nSkipped ${skipped.length} market(s) — price history unavailable.`);
+  }
+
+  return lines.join("\n").trim();
+}
+
+async function findMispricedMarkets(keywords: string[]): Promise<string> {
+  if (keywords.length < 2 || keywords.length > 4) {
+    return "Please provide between 2 and 4 keywords.";
+  }
+
+  const searchResults = await Promise.allSettled(
+    keywords.map(kw => fetchMarkets({ search: kw, limit: 10, active: true, closed: false }))
+  );
+
+  const allMarkets: Array<{ market: Market; keyword: string }> = [];
+
+  searchResults.forEach((result, i) => {
+    if (result.status === "fulfilled" && result.value) {
+      result.value.forEach(m => {
+        if (!allMarkets.find(x => x.market.id === m.id)) {
+          allMarkets.push({ market: m, keyword: keywords[i] });
+        }
+      });
+    }
+  });
+
+  if (allMarkets.length === 0) {
+    return "No markets found for the provided keywords.";
+  }
+
+  const flagged: string[] = [];
+
+  for (let i = 0; i < allMarkets.length; i++) {
+    for (let j = i + 1; j < allMarkets.length; j++) {
+      const a      = allMarkets[i];
+      const b      = allMarkets[j];
+      const pricesA = parsePrices(a.market.outcomePrices);
+      const pricesB = parsePrices(b.market.outcomePrices);
+
+      if (pricesA.length === 0 || pricesB.length === 0) continue;
+
+      const pA  = pricesA[0] * 100;
+      const pB  = pricesB[0] * 100;
+      const gap = Math.abs(pA - pB);
+
+      if (gap > 20) {
+        const [low, high] = pA < pB
+          ? [{ ...a, pct: pA }, { ...b, pct: pB }]
+          : [{ ...b, pct: pB }, { ...a, pct: pA }];
+
+        flagged.push(
+          `Market A: ${low.market.question}\n          at ${low.pct.toFixed(1)}% YES` +
+          `\nMarket B: ${high.market.question}\n          at ${high.pct.toFixed(1)}% YES` +
+          `\nImplied Gap: ${gap.toFixed(1)} percentage points` +
+          `\nFlag: POTENTIALLY MISPRICED — ${gap.toFixed(1)}pt spread between related markets suggests inconsistent pricing`
+        );
+      }
+    }
+  }
+
+  if (flagged.length === 0) {
+    return (
+      `No significant mispricings detected among the markets analyzed.\n` +
+      `(Analyzed ${allMarkets.length} markets across keywords: ${keywords.join(", ")})`
+    );
+  }
+
+  const divider = "\n─────────────────────────────────\n";
+  return `Found ${flagged.length} potentially mispriced market pair(s):\n\n${flagged.join(divider)}`;
+}
+
+async function scoreMarket(marketId: string): Promise<string> {
+  const d = await computeScore(marketId);
+  const {
+    market: m, yesProb, volumeNum, daysRemaining, sevenDayMove,
+    liquidityScore, timeScore, uncertaintyScore, momentumScore, total,
+  } = d;
+
+  let interpretation: string;
+  if      (total >= 75) interpretation = "STRONG OPPORTUNITY";
+  else if (total >= 50) interpretation = "MODERATE INTEREST";
+  else if (total >= 25) interpretation = "LOW INTEREST";
+  else                   interpretation = "AVOID";
+
+  const momentumDetail = sevenDayMove !== null
+    ? `${sevenDayMove >= 0 ? "+" : ""}${sevenDayMove.toFixed(1)} point move in 7 days`
+    : "history unavailable";
+
+  const timeDetail = m.closed
+    ? "already closed"
+    : `${daysRemaining} day${daysRemaining !== 1 ? "s" : ""} remaining`;
+
+  const uncertaintyDetail = `${(yesProb * 100).toFixed(1)}% YES${uncertaintyScore === 25 ? " — near coin flip" : ""}`;
+
+  return [
+    m.question,
+    `Overall Score: ${total}/100 — ${interpretation}`,
+    "",
+    "Breakdown:",
+    `  Liquidity:   ${String(liquidityScore).padStart(2)}/25  (${formatVolume(volumeNum)})`,
+    `  Time:        ${String(timeScore).padStart(2)}/25  (${timeDetail})`,
+    `  Uncertainty: ${String(uncertaintyScore).padStart(2)}/25  (${uncertaintyDetail})`,
+    `  Momentum:    ${String(momentumScore).padStart(2)}/25  (${momentumDetail})`,
+    "",
+    `Current YES Probability: ${(yesProb * 100).toFixed(1)}%`,
+    `Volume: ${formatVolume(volumeNum)}`,
+    `Closes: ${formatDate(m.endDate)}`,
+    "",
+    "Interpretation:",
+    "  Score 75-100: STRONG OPPORTUNITY",
+    "  Score 50-74:  MODERATE INTEREST",
+    "  Score 25-49:  LOW INTEREST",
+    "  Score 0-24:   AVOID",
+  ].join("\n");
+}
+
+async function generateTradeThesis(marketId: string, bankroll = 1000): Promise<string> {
+  const d = await computeScore(marketId);
+  const {
+    market: m, yesProb, volumeNum, daysRemaining, sevenDayMove,
+    liquidityScore, timeScore, uncertaintyScore, momentumScore, total,
+  } = d;
+
+  // Verdict
+  let verdict: string;
+  if      (total >= 75 && uncertaintyScore === 25) verdict = "RECOMMENDED TRADE";
+  else if (total >= 50)                             verdict = "WATCH — not enough conviction";
+  else                                               verdict = "PASS — insufficient opportunity";
+
+  // Direction
+  const yesPctNum = yesProb * 100;
+  let direction: string;
+  let tradeDirection: "YES" | "NO" | "NEUTRAL";
+  if      (yesPctNum < 45) { direction = "NO (bet against YES outcome)"; tradeDirection = "NO"; }
+  else if (yesPctNum > 55) { direction = "YES";                           tradeDirection = "YES"; }
+  else                      { direction = "NEUTRAL — direction unclear";   tradeDirection = "NEUTRAL"; }
+
+  // Quarter-Kelly position sizing
+  const edge            = Math.abs(yesProb - 0.5) * 2;
+  const kellyFraction   = edge * 0.25;
+  const rawPosition     = bankroll * kellyFraction;
+  const maxPosition     = bankroll * 0.15;
+  const suggestedPos    = Math.min(rawPosition, maxPosition);
+  const positionPctStr  = `${(suggestedPos / bankroll * 100).toFixed(1)}%`;
+
+  const positionLine = tradeDirection !== "NEUTRAL"
+    ? `Suggested Position: $${suggestedPos.toFixed(2)} (${positionPctStr} of $${bankroll.toLocaleString()} bankroll)`
+    : "Suggested Position: N/A (NEUTRAL — no clear directional edge)";
+
+  // Reasoning bullets
+  const pros: string[] = [];
+  const cons: string[] = [];
+
+  if (liquidityScore >= 20)
+    pros.push(`High liquidity (${formatVolume(volumeNum)}) reduces slippage risk`);
+  else if (liquidityScore <= 8)
+    cons.push(`Low liquidity (${formatVolume(volumeNum)}) increases slippage risk`);
+
+  if (timeScore >= 20)
+    pros.push(`Near-term close (${daysRemaining} day${daysRemaining !== 1 ? "s" : ""}) limits time exposure`);
+  else if (timeScore <= 5)
+    cons.push(`Long time horizon (${daysRemaining} days) increases uncertainty`);
+
+  if (uncertaintyScore === 25)
+    pros.push("Near coin-flip probability offers maximum edge potential");
+  else if (uncertaintyScore <= 5)
+    cons.push("Probability near certainty — limited edge available");
+
+  if (momentumScore >= 20)
+    pros.push("Strong momentum signals active repricing");
+  else if (momentumScore <= 3)
+    cons.push("Low momentum suggests the market hasn't been repriced recently");
+  else if (sevenDayMove === null)
+    cons.push("No price history available — momentum unknown");
+
+  const reasoningLines = [
+    ...pros.map(p => `  + ${p}`),
+    ...cons.map(c => `  - ${c}`),
+  ];
+
+  const border = "=".repeat(52);
+
+  return [
+    border,
+    `TRADE THESIS: ${m.question}`,
+    border,
+    `Verdict:  ${verdict}`,
+    "",
+    `Direction: ${direction}`,
+    `Entry Probability: ${yesPctNum.toFixed(1)}% YES`,
+    positionLine,
+    "",
+    `Score: ${total}/100`,
+    "Reasoning:",
+    ...reasoningLines,
+    "",
+    "Risk Note: This is an analytical signal, not financial advice.",
+    "Prediction markets carry significant risk of total loss.",
+    border,
+  ].join("\n");
+}
+
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "polymcp", version: "1.0.0" },
+  { name: "polymcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    // ── Original 5 ──────────────────────────────────────────────────────────
     {
       name: "search_markets",
       description: "Search active Polymarket prediction markets by keyword.",
@@ -300,6 +708,63 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["market_ids"],
       },
     },
+    // ── New analytical 4 ─────────────────────────────────────────────────────
+    {
+      name: "detect_momentum",
+      description:
+        "Search markets by keyword, fetch 7-day price history for each, and rank by momentum score. Flags markets whose probability moved significantly.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query:     { type: "string", description: "Search keyword (e.g. 'election', 'bitcoin')" },
+          threshold: { type: "number", description: "Minimum |momentum score| to flag (default 10)" },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "find_mispriced_markets",
+      description:
+        "Search for related markets using 2–4 keywords, then compare probabilities across all pairs. Flags any pair where the YES probability gap exceeds 20 points.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          keywords: {
+            type: "array",
+            items: { type: "string" },
+            minItems: 2,
+            maxItems: 4,
+            description: "2–4 related search terms to compare across (e.g. ['Fed rate cut June', 'Fed rate cut July'])",
+          },
+        },
+        required: ["keywords"],
+      },
+    },
+    {
+      name: "score_market",
+      description:
+        "Score a single market out of 100 across four dimensions: liquidity, time-to-close, uncertainty, and 7-day momentum.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          market_id: { type: "string", description: "The market condition ID" },
+        },
+        required: ["market_id"],
+      },
+    },
+    {
+      name: "generate_trade_thesis",
+      description:
+        "Generate a structured trade thesis for a market: scores it, recommends direction, sizes a position via quarter-Kelly, and explains the reasoning.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          market_id: { type: "string", description: "The market condition ID" },
+          bankroll:  { type: "number", description: "Total capital to size from in dollars (default 1000)" },
+        },
+        required: ["market_id"],
+      },
+    },
   ],
 }));
 
@@ -310,6 +775,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     let text: string;
 
     switch (name) {
+      // ── Original 5 ────────────────────────────────────────────────────────
       case "search_markets": {
         const { query, limit } = args as { query: string; limit?: number };
         if (!query || typeof query !== "string" || query.trim() === "") {
@@ -352,6 +818,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       }
 
+      // ── New analytical 4 ──────────────────────────────────────────────────
+      case "detect_momentum": {
+        const { query, threshold } = args as { query: string; threshold?: number };
+        if (!query || typeof query !== "string" || query.trim() === "") {
+          return { content: [{ type: "text", text: 'Parameter "query" must be a non-empty string.' }], isError: true };
+        }
+        text = await detectMomentum(query.trim(), threshold ?? 10);
+        break;
+      }
+
+      case "find_mispriced_markets": {
+        const { keywords } = args as { keywords: string[] };
+        if (!Array.isArray(keywords) || keywords.length < 2 || keywords.length > 4) {
+          return { content: [{ type: "text", text: '"keywords" must be an array of 2–4 strings.' }], isError: true };
+        }
+        text = await findMispricedMarkets(keywords);
+        break;
+      }
+
+      case "score_market": {
+        const { market_id } = args as { market_id: string };
+        if (!market_id || typeof market_id !== "string" || market_id.trim() === "") {
+          return { content: [{ type: "text", text: 'Parameter "market_id" must be a non-empty string.' }], isError: true };
+        }
+        text = await scoreMarket(market_id.trim());
+        break;
+      }
+
+      case "generate_trade_thesis": {
+        const { market_id, bankroll } = args as { market_id: string; bankroll?: number };
+        if (!market_id || typeof market_id !== "string" || market_id.trim() === "") {
+          return { content: [{ type: "text", text: 'Parameter "market_id" must be a non-empty string.' }], isError: true };
+        }
+        text = await generateTradeThesis(market_id.trim(), bankroll ?? 1000);
+        break;
+      }
+
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
     }
@@ -371,7 +874,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // Server runs on stdio — no console output here to avoid corrupting the MCP stream
 }
 
 main().catch((err) => {
